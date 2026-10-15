@@ -1,0 +1,535 @@
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    fetchLatestBaileysVersion, 
+    delay 
+} = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// ================================================================
+//                DEVELOPED BY R4j B4B4
+// ================================================================
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.use(express.static('public'));
+
+const APP_NAME = 'RAJ B4B4;
+const APP_VERSION = '1.3.0';
+const START_TIME = Date.now();
+
+// ---------- Log directory ----------
+const LOG_DIR = './logs';
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+const CONN_LOG = path.join(LOG_DIR, 'connection.log');
+const ERROR_LOG = path.join(LOG_DIR, 'error.log');
+
+// ---------- Global state ----------
+let sock = null;
+let botActive = false;
+let pairingRequested = false;
+
+// Reconnect protection
+let isConnecting = false;
+let reconnectTimer = null;
+let reconnectAttempts = 0;
+let manualStop = false;
+let currentGeneration = 0;      // old-socket protection
+let baileysVersionCache = null;
+
+// Task registry
+const tasks = new Map();
+const MAX_TASK_LOGS = 100;
+
+// ---------- Helpers ----------
+function genTaskId() {
+    return `RAJ-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+}
+
+function fmtUptime(ms) {
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+}
+
+function serializeTask(t) {
+    return {
+        id: t.id,
+        targetJid: t.targetJid,
+        status: t.status,
+        startTime: t.startTime,
+        endTime: t.endTime,
+        uptimeMs: (t.endTime || Date.now()) - t.startTime,
+        sentCount: t.sentCount,
+        roundCount: t.roundCount,
+        totalMessages: t.messages.length,
+        currentIndex: t.currentIndex
+    };
+}
+
+// ---------- Logging (terminal silent) ----------
+function emitLog(msg, type = 'info') {
+    io.emit('log', { message: msg, type, ts: Date.now() });
+}
+
+function taskLog(task, msg, type = 'info') {
+    const entry = { message: msg, type, ts: Date.now() };
+    task.logs.push(entry);
+    if (task.logs.length > MAX_TASK_LOGS) task.logs.shift();
+    io.emit('taskLogBroadcast', { taskId: task.id, ...entry });
+}
+
+// ---------- File logging ----------
+function writeConnLog(entry) {
+    try {
+        const line = JSON.stringify({
+            ts: new Date().toISOString(),
+            ...entry
+        }) + '\n';
+        fs.appendFileSync(CONN_LOG, line);
+    } catch (e) {}
+}
+
+function writeErrorLog(where, err) {
+    try {
+        const line = JSON.stringify({
+            ts: new Date().toISOString(),
+            where,
+            message: err?.message || String(err),
+            stack: err?.stack || null
+        }) + '\n';
+        fs.appendFileSync(ERROR_LOG, line);
+    } catch (e) {}
+}
+
+// ================================================================
+//                Session Backup (every 6 hours, keep last 3)
+// ================================================================
+function backupSession() {
+    const src = './session';
+    if (!fs.existsSync(src)) return;
+    const backupDir = './session_backups';
+    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+
+    try {
+        const dst = path.join(backupDir, `session_${Date.now()}`);
+        fs.cpSync(src, dst, { recursive: true });
+        emitLog(`[BACKUP] Session backed up`, 'info');
+
+        const backups = fs.readdirSync(backupDir).sort();
+        while (backups.length > 3) {
+            const old = backups.shift();
+            fs.rmSync(path.join(backupDir, old), { recursive: true, force: true });
+        }
+    } catch (err) {
+        emitLog(`[BACKUP FAIL] ${err.message}`, 'error');
+        writeErrorLog('backupSession', err);
+    }
+}
+
+setInterval(backupSession, 6 * 60 * 60 * 1000);
+setTimeout(backupSession, 60 * 1000);
+
+// ================================================================
+//                Reconnect backoff helper
+// ================================================================
+function getBackoffDelay(attempt) {
+    // 3 → 6 → 12 → 24 → 48 → 60 (cap)
+    const seq = [3, 6, 12, 24, 48, 60];
+    const idx = Math.min(attempt, seq.length - 1);
+    return seq[idx] * 1000;
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+}
+
+// ================================================================
+//                WhatsApp Bot Logic
+// ================================================================
+async function startBot(phoneNumber, socketId, isRetry = false) {
+    // Manual stop hone pe kuch nahi
+    if (manualStop) {
+        io.to(socketId).emit('log', { message: 'Bot is manually stopped.', type: 'warn', ts: Date.now() });
+        return;
+    }
+
+    // Already connecting? Skip
+    if (isConnecting) {
+        io.to(socketId).emit('log', { message: 'Connection already in progress...', type: 'warn', ts: Date.now() });
+        return;
+    }
+
+    // Already connected? Skip
+    if (sock && sock.user) {
+        io.to(socketId).emit('log', { message: 'Bot already connected.', type: 'warn', ts: Date.now() });
+        io.to(socketId).emit('botStatus', { connected: true });
+        return;
+    }
+
+    isConnecting = true;
+    botActive = true;
+
+    // Clear any pending reconnect timer (only ONE reconnect at a time)
+    clearReconnectTimer();
+
+    // Bump generation for old-socket protection
+    currentGeneration += 1;
+    const myGeneration = currentGeneration;
+
+    const sessionDir = './session';
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { version } = await fetchLatestBaileysVersion();
+    baileysVersionCache = version;
+
+    sock = makeWASocket({
+        version,
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: state,
+        browser: ["Ubuntu", "Chrome", "20.0.0"]
+    });
+
+    pairingRequested = false;
+
+    sock.ev.on('connection.update', async (update) => {
+        // ---------- Old-socket protection ----------
+        if (myGeneration !== currentGeneration) {
+            writeConnLog({ event: 'STALE_UPDATE_IGNORED', gen: myGeneration, current: currentGeneration });
+            return;
+        }
+
+        const { connection, lastDisconnect } = update;
+
+        // ---------- Pairing ----------
+        if (connection === 'connecting' && sock && !sock.authState.creds.registered && !pairingRequested) {
+            pairingRequested = true;
+            await delay(4000);
+            try {
+                let code = await sock.requestPairingCode(phoneNumber);
+                code = code?.match(/.{1,4}/g)?.join("-") || code;
+                emitLog(`[+] PAIRING CODE: ${code}`, 'success');
+                io.to(socketId).emit('pairingCode', code);
+                writeConnLog({ event: 'PAIRING_CODE_ISSUED' });
+            } catch (error) {
+                emitLog(`[-] Pairing Code Failed: ${error.message || error}`, 'error');
+                writeErrorLog('requestPairingCode', error);
+                isConnecting = false;
+                botActive = false;
+                sock = null;
+                io.emit('botStatus', { connected: false });
+            }
+        }
+
+        // ---------- Close ----------
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const errMsg = lastDisconnect?.error?.message || 'unknown';
+
+            // Diagnostic log
+            writeConnLog({
+                event: 'CLOSE',
+                gen: myGeneration,
+                statusCode: statusCode ?? null,
+                reason: errMsg,
+                reconnectAttempts,
+                uptimeSec: Math.floor(process.uptime()),
+                baileysVersion: baileysVersionCache,
+                isRetry
+            });
+
+            sock = null;
+            botActive = false;
+            isConnecting = false;
+            io.emit('botStatus', { connected: false });
+
+            // ---------- Manual stop? ----------
+            if (manualStop) {
+                emitLog('[-] Bot manually stopped. No reconnect.', 'warn');
+                return;
+            }
+
+            // ---------- 401 (session expired) ----------
+            if (statusCode === 401) {
+                emitLog('[-] Session expired (401). Delete "session" folder & re-pair.', 'error');
+                return;
+            }
+
+            // ---------- 500 (corrupt) ----------
+            if (statusCode === 500) {
+                emitLog('[-] Session corrupt (500). Delete "session" folder.', 'error');
+                return;
+            }
+
+            // ---------- 440 (conflict) — wait longer ----------
+            if (statusCode === 440) {
+                emitLog('[-] Conflict (440). Same number kahin aur login hai. 60s wait...', 'warn');
+                reconnectAttempts = 5; // jump to 60s backoff
+            }
+
+            // ---------- Auto reconnect with backoff ----------
+            const waitMs = getBackoffDelay(reconnectAttempts);
+            reconnectAttempts++;
+
+            emitLog(`[-] Auto reconnect in ${waitMs/1000}s... (attempt ${reconnectAttempts}, code: ${statusCode})`, 'warn');
+
+            clearReconnectTimer();
+            reconnectTimer = setTimeout(() => {
+                reconnectTimer = null;
+                startBot(phoneNumber, socketId, true);
+            }, waitMs);
+        }
+
+        // ---------- Open ----------
+        else if (connection === 'open') {
+            // Successful connection → reset counters
+            reconnectAttempts = 0;
+            isConnecting = false;
+            botActive = true;
+
+            writeConnLog({ event: 'OPEN', gen: myGeneration, baileysVersion: baileysVersionCache });
+            emitLog('[SUCCESS] WhatsApp Connected! 🎉', 'success');
+            io.emit('botStatus', { connected: true });
+        }
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+}
+
+// ================================================================
+//                Message Loop (per task) — UNTOUCHED
+// ================================================================
+async function runTaskLoop(task) {
+    task.status = 'running';
+    io.emit('taskUpdate', serializeTask(task));
+
+    while (task.loopRunning) {
+        for (let i = 0; i < task.messages.length; i++) {
+            if (!task.loopRunning) break;
+            task.currentIndex = i + 1;
+
+            let waitGuard = 0;
+            while (!sock && task.loopRunning && waitGuard < 60) {
+                await delay(1000);
+                waitGuard++;
+            }
+            if (!task.loopRunning) break;
+            if (!sock) {
+                taskLog(task, 'Bot disconnected. Pausing task.', 'warn');
+                task.loopRunning = false;
+                break;
+            }
+
+            task.sentCount++;
+            const fullMessage = `${(task.prefix || '').trim()} ${task.messages[i]}`.trim();
+
+            try {
+                await sock.sendMessage(task.targetJid, { text: fullMessage });
+                taskLog(task,
+                    `[SUCCESS] #${task.sentCount} | R${task.roundCount} [${i + 1}/${task.messages.length}]: ${fullMessage}`,
+                    'success');
+            } catch (err) {
+                taskLog(task,
+                    `[ERROR] #${task.sentCount} | Failed: ${err.message || err}`,
+                    'error');
+            }
+
+            if (task.sentCount % 5 === 0) io.emit('taskUpdate', serializeTask(task));
+            await delay(task.delayMs);
+        }
+        if (!task.loopRunning) break;
+        task.roundCount++;
+        taskLog(task, `[+] Round ${task.roundCount} finished. Restarting...`, 'info');
+    }
+
+    task.status = 'stopped';
+    task.endTime = Date.now();
+    io.emit('taskUpdate', serializeTask(task));
+    taskLog(task, `Task ${task.id} stopped. Total sent: ${task.sentCount}`, 'warn');
+}
+
+// ================================================================
+//                Health Endpoint
+// ================================================================
+app.get('/health', (req, res) => {
+    const mem = process.memoryUsage();
+    const active = [...tasks.values()].filter(t => t.status === 'running').length;
+    res.json({
+        app: APP_NAME,
+        version: APP_VERSION,
+        status: 'ok',
+        uptimeSec: Math.floor(process.uptime()),
+        uptimeHuman: fmtUptime(Date.now() - START_TIME),
+        memoryMB: Math.round(mem.rss / 1024 / 1024),
+        botConnected: !!(sock && sock.user),
+        isConnecting,
+        reconnectAttempts,
+        manualStop,
+        activeTasks: active,
+        totalTasks: tasks.size,
+        serverTime: new Date().toISOString()
+    });
+});
+
+app.head('/health', (req, res) => res.status(200).end());
+app.get('/', (req, res) => res.redirect('/index.html'));
+app.head('*', (req, res) => res.status(200).end());
+
+// ================================================================
+//                Graceful shutdown + crash handlers
+// ================================================================
+process.on('SIGINT', async () => {
+    manualStop = true;
+    clearReconnectTimer();
+    for (const t of tasks.values()) t.loopRunning = false;
+    backupSession();
+    if (sock) { try { sock.end(undefined); } catch (e) {} }
+    await delay(500);
+    process.exit(0);
+});
+process.on('SIGTERM', () => process.emit('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+    emitLog(`[FATAL] ${err.message}`, 'error');
+    writeErrorLog('uncaughtException', err);
+});
+process.on('unhandledRejection', (reason) => {
+    emitLog(`[FATAL REJECTION] ${reason}`, 'error');
+    writeErrorLog('unhandledRejection', reason);
+});
+
+// ================================================================
+//                Socket.IO Events
+// ================================================================
+io.on('connection', (socket) => {
+    socket.emit('botStatus', { connected: !!(sock && sock.user) });
+    socket.emit('taskList', [...tasks.values()].map(serializeTask));
+
+    // -------- Connect Bot --------
+    socket.on('connectBot', async (data) => {
+        const phoneNumber = (data.phoneNumber || '').replace(/[^0-9]/g, '');
+        if (!phoneNumber) {
+            socket.emit('log', { message: 'Phone number required.', type: 'error', ts: Date.now() });
+            return;
+        }
+        // Fresh manual connect → reset flags
+        manualStop = false;
+        reconnectAttempts = 0;
+        await startBot(phoneNumber, socket.id);
+    });
+
+    // -------- Fetch Groups --------
+    socket.on('getGroups', async () => {
+        if (!sock) {
+            socket.emit('log', { message: 'Pehle connect karo.', type: 'warn', ts: Date.now() });
+            return;
+        }
+        try {
+            const groups = await sock.groupFetchAllParticipating();
+            const list = Object.values(groups).map(g => ({ id: g.id, subject: g.subject }));
+            socket.emit('groupList', list);
+            socket.emit('log', { message: `Fetched ${list.length} groups.`, type: 'success', ts: Date.now() });
+        } catch (err) {
+            socket.emit('log', { message: `Group fetch error: ${err.message || err}`, type: 'error', ts: Date.now() });
+        }
+    });
+
+    // -------- Start Task --------
+    socket.on('startTask', async (data) => {
+        if (!sock) {
+            socket.emit('log', { message: 'Pehle bot connect karo.', type: 'error', ts: Date.now() });
+            return;
+        }
+        const { targetJid, messages, prefix, delay: delaySec } = data;
+        if (!targetJid || !messages?.length) {
+            socket.emit('log', { message: 'Target/messages missing.', type: 'error', ts: Date.now() });
+            return;
+        }
+
+        const taskId = genTaskId();
+        const delayMs = (parseInt(delaySec) || 5) * 1000;
+
+        const task = {
+            id: taskId, targetJid, messages: [...messages],
+            prefix: prefix || '', delayMs,
+            status: 'starting', startTime: Date.now(), endTime: null,
+            sentCount: 0, roundCount: 1, currentIndex: 0,
+            loopRunning: true, logs: []
+        };
+
+        tasks.set(taskId, task);
+        emitLog(`Task ${taskId} created → ${targetJid}`, 'success');
+        socket.emit('taskCreated', serializeTask(task));
+        io.emit('taskList', [...tasks.values()].map(serializeTask));
+        runTaskLoop(task);
+    });
+
+    // -------- Stop Task --------
+    socket.on('stopTask', (data) => {
+        const task = tasks.get(data?.taskId);
+        if (!task) {
+            socket.emit('log', { message: `Task not found.`, type: 'error', ts: Date.now() });
+            return;
+        }
+        task.loopRunning = false;
+        taskLog(task, 'Stop requested by user.', 'warn');
+        io.emit('taskUpdate', serializeTask(task));
+    });
+
+    // -------- Get Task Info --------
+    socket.on('getTaskInfo', (data) => {
+        const task = tasks.get(data?.taskId);
+        if (!task) { socket.emit('taskInfo', { error: 'Not found', taskId: data?.taskId }); return; }
+        socket.emit('taskInfo', {
+            ...serializeTask(task),
+            uptimeHuman: fmtUptime((task.endTime || Date.now()) - task.startTime),
+            logs: task.logs
+        });
+    });
+
+    socket.on('getTasks', () => {
+        socket.emit('taskList', [...tasks.values()].map(serializeTask));
+    });
+
+    // -------- Stop Bot (manual) --------
+    socket.on('stopBot', () => {
+        manualStop = true;
+        clearReconnectTimer();
+        isConnecting = false;
+        reconnectAttempts = 0;
+
+        for (const t of tasks.values()) t.loopRunning = false;
+        try { if (sock) sock.end(undefined); } catch (e) {}
+        sock = null;
+        botActive = false;
+
+        emitLog('Bot stopped by user. Auto-reconnect disabled.', 'warn');
+        writeConnLog({ event: 'MANUAL_STOP' });
+        io.emit('botStatus', { connected: false });
+    });
+
+    socket.on('disconnect', () => {});
+});
+
+// ================================================================
+//                Start Server
+// ================================================================
+const PORT = process.env.PORT || 26124;
+server.listen(PORT, () => {
+    writeConnLog({ event: 'SERVER_START', version: APP_VERSION });
+});
